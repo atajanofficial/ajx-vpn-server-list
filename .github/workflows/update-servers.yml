@@ -1,0 +1,61 @@
+name: Update server list
+
+# The public list is refreshed every 30 minutes. GitHub Actions scheduling is
+# best-effort: a run can be delayed during busy periods, so the Android client
+# never treats this cadence as a guarantee and always keeps its cache.
+on:
+  schedule:
+    # UTC. Delays are handled by the client-side cache and retry policy.
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+# Least privilege: the job only needs to write repository contents.
+permissions:
+  contents: write
+
+# Never run two refreshes at the same time. Queued runs wait for the active one
+# instead of cancelling it, so a partially written list is never pushed.
+concurrency:
+  group: ajx-vpn-server-list-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    name: Refresh VPN Gate server list
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Scheduled and manual runs must publish from the default branch only.
+    if: github.ref_name == github.event.repository.default_branch
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run parser and generator tests
+        run: python -m unittest discover -s scripts -p "test_*.py" -v
+
+      - name: Fetch the official VPN Gate feed
+        run: python scripts/fetch_servers.py --output "$RUNNER_TEMP/vpngate.csv"
+
+      - name: Validate and generate the list
+        id: generate
+        run: python scripts/generate_server_list.py --root . --raw "$RUNNER_TEMP/vpngate.csv"
+
+      - name: Commit only when the list changed
+        run: |
+          set -euo pipefail
+          if [ -z "$(git status --porcelain -- servers.txt servers.json metadata.json)" ]; then
+            echo "No server-list change; nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add servers.txt servers.json metadata.json
+          git commit -m "chore: refresh VPN Gate server list"
+          git push

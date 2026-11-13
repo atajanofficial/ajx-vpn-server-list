@@ -1,0 +1,12 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Local scratch files
+*.tmp
+raw.csv
+vpngate.csv
+
+# OS noise
+.DS_Store
+Thumbs.db

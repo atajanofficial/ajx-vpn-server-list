@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "list_format_version": 1,
+  "source": {
+    "name": "VPN Gate",
+    "url": "https://www.vpngate.net/api/iphone/",
+    "retrieved_at": 1794485699687
+  },
+  "generated_at": 1794485699687,
+  "last_changed_at": 1794485699687,
+  "server_count": 92,
+  "protocol_counts": {
+    "tcp": 83,
+    "udp": 9
+  },
+  "validation_counts": {
+    "DISCOVERED": 92
+  },
+  "content_hash": "bdeb3d4d6c559e8ddd3b5b93aa8581b087127cb5605bbb97250cce71bfbbdf1b",
+  "published_files": [
+    "servers.txt",
+    "servers.json"
+  ],
+  "parse_stats": {
+    "source_rows": 94,
+    "accepted": 92,
+    "skipped_invalid": 0,
+    "skipped_duplicate": 2,
+    "rejection_reasons": {}
+  },
+  "notes": [
+    "DISCOVERED means the record passed structural validation.",
+    "No server is probed by this workflow; reachability is not claimed.",
+    "servers.json is the authoritative list consumed by the Android app."
+  ]
+}
