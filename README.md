@@ -149,11 +149,15 @@ Python 3.11+ is required. The scripts use only the standard library.
 ## Android consumption
 
 After deployment, configure the Android build with the raw URL of
-`servers.json`, for example:
+`servers.json`. The published list for this repository is:
 
 ```
-https://raw.githubusercontent.com/<owner>/<repository>/<default-branch>/servers.json
+https://raw.githubusercontent.com/atajanofficial/ajx-vpn-server-list/main/servers.json
 ```
+
+`raw.githubusercontent.com` caches responses for a few minutes after a refresh,
+so a client may briefly see the previous list; the `ETag` changes when the
+content does.
 
 The exact configuration key (`github.servers.json.url` in `local.properties`)
 and the end-to-end verification steps are documented in the AJX VPN project's
