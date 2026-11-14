@@ -4,28 +4,28 @@
   "source": {
     "name": "VPN Gate",
     "url": "https://www.vpngate.net/api/iphone/",
-    "retrieved_at": 1794669264984
+    "retrieved_at": 1794686387817
   },
-  "generated_at": 1794669264984,
-  "last_changed_at": 1794669264984,
-  "server_count": 97,
+  "generated_at": 1794686387817,
+  "last_changed_at": 1794686387817,
+  "server_count": 94,
   "protocol_counts": {
-    "tcp": 81,
-    "udp": 16
+    "tcp": 77,
+    "udp": 17
   },
   "validation_counts": {
-    "DISCOVERED": 97
+    "DISCOVERED": 94
   },
-  "content_hash": "fe810edceda6b712650b7c44840149a4f888839ca49eec8864b4b228b53f1b4f",
+  "content_hash": "022c606cac283b502cd06c5770987ca31b99644d0650a57e571b5fa633e42abd",
   "published_files": [
     "servers.txt",
     "servers.json"
   ],
   "parse_stats": {
-    "source_rows": 98,
-    "accepted": 97,
+    "source_rows": 96,
+    "accepted": 94,
     "skipped_invalid": 0,
-    "skipped_duplicate": 1,
+    "skipped_duplicate": 2,
     "rejection_reasons": {}
   },
   "notes": [
