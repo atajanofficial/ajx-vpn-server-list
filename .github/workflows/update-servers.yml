@@ -47,6 +47,11 @@ jobs:
         id: generate
         run: python scripts/generate_server_list.py --root . --raw "$RUNNER_TEMP/vpngate.csv"
 
+      # Independent safety net: parse the published TXT back and compare it with
+      # servers.json. This fails the job before any commit if a field was lost.
+      - name: Verify servers.txt round-trips
+        run: python scripts/generate_server_list.py --root . --from-json
+
       - name: Commit only when the list changed
         run: |
           set -euo pipefail

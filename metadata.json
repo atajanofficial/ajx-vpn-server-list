@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "list_format_version": 1,
+  "list_format_version": 2,
   "source": {
     "name": "VPN Gate",
     "url": "https://www.vpngate.net/api/iphone/",
@@ -21,16 +21,19 @@
     "servers.txt",
     "servers.json"
   ],
+  "primary_format": "servers.txt",
+  "compatibility_format": "servers.json",
   "parse_stats": {
-    "source_rows": 98,
+    "source_rows": 94,
     "accepted": 94,
     "skipped_invalid": 0,
-    "skipped_duplicate": 4,
+    "skipped_duplicate": 0,
     "rejection_reasons": {}
   },
   "notes": [
     "DISCOVERED means the record passed structural validation.",
     "No server is probed by this workflow; reachability is not claimed.",
-    "servers.json is the authoritative list consumed by the Android app."
+    "servers.txt is the primary list consumed by the Android app.",
+    "servers.json carries the same records in the compatible schema v1 envelope."
   ]
 }

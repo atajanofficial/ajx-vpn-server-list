@@ -21,11 +21,18 @@ from generate_server_list import (
     SERVERS_JSON,
     SERVERS_TXT,
     GenerationError,
+    build_servers_txt,
+    canonical_payload,
     generate,
+    regenerate_from_json,
 )
 from validate_servers import (
     EmptySourceError,
+    SourceFormatError,
+    TXT_COLUMNS,
     is_public_ipv4,
+    parse_servers_json,
+    parse_servers_txt,
     parse_source,
     protocol_of,
 )
@@ -86,6 +93,32 @@ def make_row(
 
 def make_feed(rows: List[str]) -> str:
     return "\n".join(["*vpn_servers", HEADER, *rows, "*"]) + "\n"
+
+
+def make_txt(feed: str, refresh_ms: int = 1_700_000_000_000) -> str:
+    result = parse_source(feed, min_servers=1)
+    return build_servers_txt(result.records, refresh_ms)
+
+
+def split_txt(text: str):
+    lines = text.splitlines()
+    header_index = next(
+        index for index, line in enumerate(lines) if line.startswith("# columns=")
+    )
+    columns = lines[header_index][len("# columns="):].split("\t")
+    data = [
+        line.split("\t")
+        for line in lines
+        if line.strip() and not line.startswith("#")
+    ]
+    return lines, header_index, columns, data
+
+
+def join_txt(lines, header_index, columns, data) -> str:
+    updated = list(lines)
+    updated[header_index] = "# columns=" + "\t".join(columns)
+    body = ["\t".join(row) for row in data]
+    return "\n".join(updated[: header_index + 1] + body) + "\n"
 
 
 class ValidationTest(unittest.TestCase):
@@ -227,11 +260,16 @@ class GenerationTest(unittest.TestCase):
     def test_servers_txt_is_versioned(self) -> None:
         generate(self.root, make_feed([make_row()]), now_ms=1_700_000_000_000, min_servers=1)
         text = self._read(SERVERS_TXT)
-        self.assertIn("# format_version=1", text)
+        self.assertIn("# format_version=2", text)
         self.assertIn("# columns=server_id\tip\t", text)
+        header = next(
+            line for line in text.splitlines() if line.startswith("# columns=")
+        )
+        self.assertEqual(list(TXT_COLUMNS), header[len("# columns="):].split("\t"))
         data_lines = [line for line in text.splitlines() if line and not line.startswith("#")]
         self.assertEqual(1, len(data_lines))
-        self.assertEqual(10, len(data_lines[0].split("\t")))
+        self.assertEqual(len(TXT_COLUMNS), len(data_lines[0].split("\t")))
+        self.assertIn("openvpn_config_base64", header)
 
     def test_stable_output_for_same_input(self) -> None:
         feed = make_feed([make_row()])
@@ -337,6 +375,181 @@ class GenerationTest(unittest.TestCase):
                 "",
                 0,
             )
+
+    def test_txt_round_trips_every_field(self) -> None:
+        feed = make_feed(
+            [
+                make_row(ip="1.2.3.4", code="JP", score=100),
+                make_row(
+                    ip="5.6.7.8",
+                    code="US",
+                    score=200,
+                    config=make_config(host="5.6.7.8", proto="tcp", port=443),
+                ),
+            ]
+        )
+        generate(self.root, feed, now_ms=1_700_000_000_000, min_servers=1)
+
+        parsed = parse_servers_txt(self._read(SERVERS_TXT), min_servers=1)
+        document = json.loads(self._read(SERVERS_JSON))
+
+        self.assertEqual(2, len(parsed.records))
+        self.assertEqual(document["servers"], canonical_payload(parsed.records))
+
+    def test_regenerate_from_json_rebuilds_txt(self) -> None:
+        generate(
+            self.root,
+            make_feed([make_row(ip="1.2.3.4")]),
+            now_ms=1_700_000_000_000,
+            min_servers=1,
+        )
+        json_before = self._read(SERVERS_JSON)
+
+        # Simulate a repository still carrying the lossy v1 summary.
+        metadata = json.loads(self._read(METADATA_JSON))
+        metadata["list_format_version"] = 1
+        with open(os.path.join(self.root, METADATA_JSON), "w", encoding="utf-8") as handle:
+            json.dump(metadata, handle)
+        with open(os.path.join(self.root, SERVERS_TXT), "w", encoding="utf-8") as handle:
+            handle.write("# AJX VPN server list\n# format_version=1\n")
+
+        result = regenerate_from_json(self.root, min_servers=1)
+
+        self.assertTrue(result.changed)
+        self.assertIn("# format_version=2", self._read(SERVERS_TXT))
+        self.assertEqual(
+            2, json.loads(self._read(METADATA_JSON))["list_format_version"]
+        )
+        self.assertEqual(json_before, self._read(SERVERS_JSON))
+        self.assertFalse(regenerate_from_json(self.root, min_servers=1).changed)
+
+    def test_format_upgrade_rewrites_unchanged_content(self) -> None:
+        feed = make_feed([make_row()])
+        generate(self.root, feed, now_ms=1_700_000_000_000, min_servers=1)
+
+        metadata = json.loads(self._read(METADATA_JSON))
+        metadata["list_format_version"] = 1
+        with open(os.path.join(self.root, METADATA_JSON), "w", encoding="utf-8") as handle:
+            json.dump(metadata, handle)
+
+        result = generate(
+            self.root,
+            feed,
+            now_ms=1_800_000_000_000,
+            min_servers=1,
+        )
+
+        self.assertTrue(result.changed)
+        self.assertIn("# format_version=2", self._read(SERVERS_TXT))
+
+
+class TxtParsingTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.text = make_txt(make_feed([make_row(ip="1.2.3.4")]))
+        self.lines, self.header_index, self.columns, self.data = split_txt(self.text)
+
+    def _parse(self, text: str):
+        return parse_servers_txt(text, min_servers=1)
+
+    def test_valid_txt_is_parsed(self) -> None:
+        parsed = self._parse(self.text)
+
+        self.assertEqual(1, len(parsed.records))
+        self.assertEqual(1_700_000_000_000, parsed.refresh_ms)
+        record = parsed.records[0]
+        self.assertEqual("1.2.3.4", record.ip)
+        self.assertEqual("udp", record.protocol)
+        self.assertEqual(1194, record.port)
+        self.assertTrue(record.openvpn_config_base64)
+
+    def test_v1_is_rejected(self) -> None:
+        v1 = self.text.replace("# format_version=2", "# format_version=1", 1)
+        with self.assertRaises(SourceFormatError):
+            self._parse(v1)
+
+    def test_missing_column_is_rejected(self) -> None:
+        index = self.columns.index("openvpn_config_base64")
+        columns = [name for name in self.columns if name != "openvpn_config_base64"]
+        data = [
+            [value for position, value in enumerate(row) if position != index]
+            for row in self.data
+        ]
+        with self.assertRaises(SourceFormatError):
+            self._parse(join_txt(self.lines, self.header_index, columns, data))
+
+    def test_wrong_field_count_is_rejected(self) -> None:
+        data = [row[:-1] for row in self.data]
+        with self.assertRaises(SourceFormatError):
+            self._parse(join_txt(self.lines, self.header_index, self.columns, data))
+
+    def test_duplicate_ip_is_rejected(self) -> None:
+        data = self.data + [list(self.data[0])]
+        with self.assertRaises(SourceFormatError):
+            self._parse(join_txt(self.lines, self.header_index, self.columns, data))
+
+    def test_empty_txt_is_rejected(self) -> None:
+        with self.assertRaises(EmptySourceError):
+            self._parse("")
+        header_only = (
+            "# AJX VPN server list\n"
+            "# format_version=2\n"
+            "# last_updated=1700000000000\n"
+            "# columns=" + "\t".join(TXT_COLUMNS) + "\n"
+        )
+        with self.assertRaises(EmptySourceError):
+            self._parse(header_only)
+
+    def test_bad_base64_is_rejected(self) -> None:
+        data = [list(row) for row in self.data]
+        data[0][self.columns.index("openvpn_config_base64")] = "not-base64!!"
+        with self.assertRaises(SourceFormatError):
+            self._parse(join_txt(self.lines, self.header_index, self.columns, data))
+
+    def test_remote_mismatch_is_rejected(self) -> None:
+        data = [list(row) for row in self.data]
+        data[0][self.columns.index("ip")] = "9.9.9.9"
+        with self.assertRaises(SourceFormatError):
+            self._parse(join_txt(self.lines, self.header_index, self.columns, data))
+
+    def test_port_mismatch_is_rejected(self) -> None:
+        data = [list(row) for row in self.data]
+        data[0][self.columns.index("port")] = "443"
+        with self.assertRaises(SourceFormatError):
+            self._parse(join_txt(self.lines, self.header_index, self.columns, data))
+
+    def test_protocol_mismatch_is_rejected(self) -> None:
+        data = [list(row) for row in self.data]
+        data[0][self.columns.index("protocol")] = "TCP"
+        with self.assertRaises(SourceFormatError):
+            self._parse(join_txt(self.lines, self.header_index, self.columns, data))
+
+    def test_crlf_and_bom_are_accepted(self) -> None:
+        crlf = "\ufeff" + self.text.replace("\n", "\r\n")
+        parsed = self._parse(crlf)
+        self.assertEqual(1, len(parsed.records))
+
+    def test_utf8_country_is_preserved(self) -> None:
+        text = make_txt(
+            make_feed([make_row(ip="1.2.3.4", country="日本", code="JP")])
+        )
+        parsed = self._parse(text)
+        self.assertEqual("日本", parsed.records[0].country)
+
+    def test_columns_are_mapped_by_name(self) -> None:
+        columns = list(self.columns)
+        first = columns.index("country_code")
+        second = columns.index("country_name")
+        columns[first], columns[second] = columns[second], columns[first]
+        data = []
+        for row in self.data:
+            row = list(row)
+            row[first], row[second] = row[second], row[first]
+            data.append(row)
+
+        parsed = self._parse(join_txt(self.lines, self.header_index, columns, data))
+
+        self.assertEqual("JP", parsed.records[0].country_code)
+        self.assertEqual("Japan", parsed.records[0].country)
 
 
 if __name__ == "__main__":

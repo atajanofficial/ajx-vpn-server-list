@@ -20,13 +20,16 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 SOURCE_URL = "https://www.vpngate.net/api/iphone/"
 SOURCE_NAME = "VPN Gate"
-LIST_FORMAT_VERSION = 1
+# v2 makes servers.txt self-sufficient: it now carries every field the Android
+# client needs, including the inline OpenVPN profile. v1 was a lossy summary.
+LIST_FORMAT_VERSION = 2
 SERVER_JSON_SCHEMA_VERSION = 1
 
 MAX_CONFIG_BASE64_CHARS = 1_500_000
@@ -34,6 +37,33 @@ MAX_CONFIG_CHARS = 1_000_000
 MAX_SERVER_ID_CHARS = 96
 MIN_EXPECTED_SERVERS = 5
 FIELD_COUNT = 15
+MAX_LIST_RECORDS = 10_000
+
+# The canonical servers.txt column order. Parsers must map by name, not by
+# position, so a future column can be inserted without breaking old clients.
+TXT_COLUMNS = (
+    "server_id",
+    "ip",
+    "country_code",
+    "country_name",
+    "hostname",
+    "port",
+    "protocol",
+    "score",
+    "ping",
+    "speed",
+    "sessions",
+    "uptime",
+    "total_users",
+    "total_traffic",
+    "log_type",
+    "operator",
+    "message",
+    "openvpn_config_base64",
+    "validation_state",
+    "source",
+    "last_updated",
+)
 
 REMOTE_LINE = re.compile(r"(?im)^\s*remote\s+(\S+)(?:\s+(\d+))?")
 REMOTE_LINE_ANY = re.compile(r"(?im)^\s*remote\s+\S+")
@@ -97,6 +127,15 @@ class ValidationResult:
     records: List[ServerRecord]
     stats: ValidationStats
     header_seen: bool
+
+
+@dataclass
+class ParsedList:
+    """A validated list plus the provenance needed to re-publish it."""
+
+    records: List[ServerRecord]
+    refresh_ms: int
+    stats: ValidationStats
 
 
 def parse_csv_line(line: str) -> List[str]:
@@ -397,6 +436,318 @@ def parse_source(raw: str, min_servers: int = MIN_EXPECTED_SERVERS) -> Validatio
         )
 
     return ValidationResult(records=records, stats=stats, header_seen=header_seen)
+
+
+def _parse_non_negative(value: object, maximum: Optional[int] = None) -> int:
+    try:
+        number = int(str(value if value is not None else "").strip().replace(",", ""))
+    except ValueError:
+        return 0
+    number = max(number, 0)
+    return min(number, maximum) if maximum is not None else number
+
+
+def _clean_or_reject(value: str, field_name: str, max_length: int) -> str:
+    try:
+        return clean_text(value, field_name, max_length)
+    except ValueError as error:
+        raise SourceFormatError(str(error)) from error
+
+
+def _build_record(
+    *,
+    server_id: object,
+    ip: str,
+    hostname: object,
+    country: object,
+    country_code: object,
+    score: object,
+    ping: object,
+    speed: object,
+    sessions: object,
+    uptime: object,
+    total_users: object,
+    total_traffic: object,
+    log_type: object,
+    operator: object,
+    message: object,
+    encoded: str,
+    protocol: object,
+    port: object,
+) -> ServerRecord:
+    """Validates one record from any published format.
+
+    The rules are identical for the raw VPN Gate feed, servers.json and
+    servers.txt, so a record cannot become valid merely by changing formats.
+    """
+
+    address = (ip or "").strip()
+    if not is_public_ipv4(address):
+        raise SourceFormatError(f"invalid relay IP: {address!r}")
+
+    if not encoded or not encoded.strip():
+        raise SourceFormatError("record has no OpenVPN configuration")
+    config = decode_config(encoded)
+    if config is None:
+        raise SourceFormatError("record OpenVPN configuration is not valid base64")
+    if not looks_like_openvpn(config):
+        raise SourceFormatError("record OpenVPN configuration is invalid")
+
+    remote_host, config_port = remote_host_port(config)
+    if not remote_host:
+        raise SourceFormatError("record OpenVPN configuration has no remote")
+    if remote_host != address:
+        raise SourceFormatError("record OpenVPN remote does not match the record IP")
+    if config_port is None:
+        raise SourceFormatError("record OpenVPN remote has no valid port")
+
+    config_protocol = protocol_of(config)
+    if config_protocol == "unknown":
+        raise SourceFormatError("record OpenVPN protocol is unsupported")
+    reported_protocol = str(protocol or "").strip().lower()
+    if reported_protocol and reported_protocol != config_protocol:
+        raise SourceFormatError("record protocol does not match the OpenVPN configuration")
+
+    try:
+        reported_port = int(str(port if port is not None else "").strip())
+    except ValueError as error:
+        raise SourceFormatError("record port is invalid") from error
+    if reported_port != config_port:
+        raise SourceFormatError("record port does not match the OpenVPN configuration")
+
+    identifier = str(server_id or "").strip()
+    if not identifier:
+        identifier = stable_server_id(address)
+    if len(identifier) > MAX_SERVER_ID_CHARS or not SERVER_ID_PATTERN.match(identifier):
+        raise SourceFormatError("record server id is invalid")
+
+    return ServerRecord(
+        server_id=identifier,
+        ip=address,
+        hostname=_clean_or_reject(str(hostname or address), "hostname", 255) or address,
+        country=_clean_or_reject(str(country or "Unknown"), "country", 96) or "Unknown",
+        country_code=normalize_country_code(str(country_code or "")),
+        score=_parse_non_negative(score),
+        ping=_parse_non_negative(ping, 2_147_483_647),
+        speed=_parse_non_negative(speed),
+        sessions=_parse_non_negative(sessions, 2_147_483_647),
+        uptime=_clean_or_reject(str(uptime or ""), "uptime", 64),
+        total_users=_parse_non_negative(total_users, 2_147_483_647),
+        total_traffic=_clean_or_reject(str(total_traffic or ""), "total traffic", 64),
+        log_type=_clean_or_reject(str(log_type or ""), "log type", 64),
+        operator=_clean_or_reject(str(operator or ""), "operator", 160),
+        message=_clean_or_reject(str(message or ""), "message", 512),
+        # Re-encode so every format carries the same canonical base64.
+        openvpn_config_base64=base64.b64encode(config.encode("utf-8")).decode("ascii"),
+        protocol=config_protocol,
+        port=config_port,
+    )
+
+
+def parse_servers_json(
+    raw: str, min_servers: int = MIN_EXPECTED_SERVERS
+) -> ParsedList:
+    """Parses a committed servers.json back into validated records.
+
+    This is the regeneration path: servers.txt and metadata.json can be rebuilt
+    from the authoritative JSON without downloading the upstream feed again.
+    """
+
+    try:
+        document = json.loads(raw)
+    except ValueError as error:
+        raise SourceFormatError(f"servers.json is not valid JSON: {error}") from error
+    if not isinstance(document, dict):
+        raise SourceFormatError("servers.json is not a JSON object")
+    if document.get("schema_version") != SERVER_JSON_SCHEMA_VERSION:
+        raise SourceFormatError("servers.json has an unsupported schema version")
+
+    refresh_ms = document.get("last_successful_refresh")
+    if not isinstance(refresh_ms, int) or isinstance(refresh_ms, bool) or refresh_ms <= 0:
+        raise SourceFormatError("servers.json has no valid refresh timestamp")
+
+    servers = document.get("servers")
+    if not isinstance(servers, list):
+        raise SourceFormatError("servers.json has no server array")
+    if len(servers) > MAX_LIST_RECORDS:
+        raise SourceFormatError("servers.json has too many records")
+    if not servers:
+        raise EmptySourceError("servers.json contains no servers")
+
+    records: List[ServerRecord] = []
+    seen_ips = set()
+    for index, entry in enumerate(servers):
+        if not isinstance(entry, dict):
+            raise SourceFormatError(f"servers.json record {index} is not an object")
+        address = str(entry.get("ip") or "").strip()
+        if address in seen_ips:
+            raise SourceFormatError(f"servers.json contains a duplicate relay IP: {address}")
+        seen_ips.add(address)
+        try:
+            record = _build_record(
+                server_id=entry.get("id"),
+                ip=address,
+                hostname=entry.get("hostname"),
+                country=entry.get("country"),
+                country_code=entry.get("country_code"),
+                score=entry.get("score"),
+                ping=entry.get("ping"),
+                speed=entry.get("speed"),
+                sessions=entry.get("sessions"),
+                uptime=entry.get("uptime"),
+                total_users=entry.get("total_users"),
+                total_traffic=entry.get("total_traffic"),
+                log_type=entry.get("log_type"),
+                operator=entry.get("operator"),
+                message=entry.get("message"),
+                encoded=str(entry.get("openvpn_config_base64") or ""),
+                protocol=entry.get("protocol"),
+                port=entry.get("port"),
+            )
+        except SourceFormatError as error:
+            raise SourceFormatError(f"servers.json record {index}: {error}") from error
+        records.append(record)
+
+    if len(records) < min_servers:
+        raise EmptySourceError(
+            f"servers.json contains only {len(records)} usable records; "
+            f"refusing to publish fewer than {min_servers}"
+        )
+
+    stats = ValidationStats(source_rows=len(servers), accepted=len(records))
+    return ParsedList(records=records, refresh_ms=int(refresh_ms), stats=stats)
+
+
+def parse_servers_txt(
+    raw: str, min_servers: int = MIN_EXPECTED_SERVERS
+) -> ParsedList:
+    """Parses the header-driven servers.txt format.
+
+    The parser maps columns by name and rejects a v1 summary: a list without
+    OpenVPN profiles cannot be used as the primary client source.
+    """
+
+    if raw is None or not raw.strip():
+        raise EmptySourceError("servers.txt is empty")
+
+    format_version: Optional[int] = None
+    columns: Optional[List[str]] = None
+    refresh_ms: Optional[int] = None
+    rows: List[List[str]] = []
+
+    for raw_line in raw.lstrip("\ufeff").splitlines():
+        line = raw_line.rstrip("\r")
+        if not line.strip():
+            continue
+        if line.startswith("#"):
+            content = line[1:].strip()
+            if "=" not in content:
+                continue
+            key, value = content.split("=", 1)
+            key = key.strip()
+            if key == "format_version":
+                try:
+                    format_version = int(value.strip())
+                except ValueError as error:
+                    raise SourceFormatError("servers.txt has an invalid format_version") from error
+            elif key == "columns":
+                columns = value.split("\t")
+            elif key == "last_updated":
+                try:
+                    refresh_ms = int(value.strip())
+                except ValueError as error:
+                    raise SourceFormatError("servers.txt has an invalid last_updated") from error
+            continue
+
+        if columns is None:
+            raise SourceFormatError("servers.txt data appears before the columns header")
+        rows.append(line.split("\t"))
+
+    if format_version is None:
+        raise SourceFormatError("servers.txt has no format_version header")
+    if format_version < 2:
+        raise SourceFormatError(
+            f"servers.txt format version {format_version} is a lossy summary and "
+            "cannot be used as the primary list"
+        )
+    if columns is None:
+        raise SourceFormatError("servers.txt has no columns header")
+    if len(set(columns)) != len(columns):
+        raise SourceFormatError("servers.txt has duplicate column names")
+    missing = [name for name in TXT_COLUMNS if name not in columns]
+    if missing:
+        raise SourceFormatError(
+            "servers.txt is missing required columns: " + ", ".join(missing)
+        )
+    if refresh_ms is None or refresh_ms <= 0:
+        raise SourceFormatError("servers.txt has no valid last_updated header")
+    if not rows:
+        raise EmptySourceError("servers.txt contains no records")
+    if len(rows) > MAX_LIST_RECORDS:
+        raise SourceFormatError("servers.txt has too many records")
+
+    index = {name: position for position, name in enumerate(columns)}
+
+    def field(row: List[str], name: str) -> str:
+        return row[index[name]]
+
+    records: List[ServerRecord] = []
+    seen_ips = set()
+    for row_number, row in enumerate(rows, start=1):
+        if len(row) != len(columns):
+            raise SourceFormatError(
+                f"servers.txt record {row_number} has {len(row)} fields; "
+                f"expected {len(columns)}"
+            )
+        address = field(row, "ip").strip()
+        if address in seen_ips:
+            raise SourceFormatError(
+                f"servers.txt contains a duplicate relay IP: {address}"
+            )
+        seen_ips.add(address)
+        try:
+            record = _build_record(
+                server_id=field(row, "server_id"),
+                ip=address,
+                hostname=field(row, "hostname"),
+                country=field(row, "country_name"),
+                country_code=field(row, "country_code"),
+                score=field(row, "score"),
+                ping=field(row, "ping"),
+                speed=field(row, "speed"),
+                sessions=field(row, "sessions"),
+                uptime=field(row, "uptime"),
+                total_users=field(row, "total_users"),
+                total_traffic=field(row, "total_traffic"),
+                log_type=field(row, "log_type"),
+                operator=field(row, "operator"),
+                message=field(row, "message"),
+                encoded=field(row, "openvpn_config_base64"),
+                protocol=field(row, "protocol"),
+                port=field(row, "port"),
+            )
+        except SourceFormatError as error:
+            raise SourceFormatError(
+                f"servers.txt record {row_number}: {error}"
+            ) from error
+        if not field(row, "validation_state").strip():
+            raise SourceFormatError(
+                f"servers.txt record {row_number}: validation_state is empty"
+            )
+        if not field(row, "source").strip():
+            raise SourceFormatError(
+                f"servers.txt record {row_number}: source is empty"
+            )
+        records.append(record)
+
+    if len(records) < min_servers:
+        raise EmptySourceError(
+            f"servers.txt contains only {len(records)} usable records; "
+            f"refusing to publish fewer than {min_servers}"
+        )
+
+    stats = ValidationStats(source_rows=len(rows), accepted=len(records))
+    return ParsedList(records=records, refresh_ms=int(refresh_ms), stats=stats)
 
 
 def protocol_counts(records: List[ServerRecord]) -> Dict[str, int]:

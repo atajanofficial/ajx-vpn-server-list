@@ -8,8 +8,8 @@ server list.
   used by the AJX VPN project)
 - **Refresh schedule:** every 30 minutes, UTC (`*/30 * * * *`), plus manual
   `workflow_dispatch`
-- **Published files:** `servers.json` (authoritative), `servers.txt`
-  (human-readable summary), `metadata.json` (counts and provenance)
+- **Published files:** `servers.txt` (primary, format v2), `servers.json`
+  (compatibility mirror), `metadata.json` (counts and provenance)
 - **No secrets:** the repository contains no credentials, tokens, private keys,
   or user data. GitHub Actions uses the automatically provided `GITHUB_TOKEN`
   with `contents: write` only.
@@ -18,8 +18,8 @@ server list.
 
 | File | Purpose |
 | --- | --- |
-| `servers.json` | Android-compatible schema v1 list, including inline OpenVPN profiles |
-| `servers.txt` | Tab-separated, versioned summary for humans and diagnostics |
+| `servers.txt` | Primary list, header-driven format v2, including inline OpenVPN profiles |
+| `servers.json` | The same records in the Android-compatible schema v1 envelope |
 | `metadata.json` | Source, timestamps, protocol/validation counts, content hash |
 | `scripts/fetch_servers.py` | Downloads the official feed over verified HTTPS |
 | `scripts/validate_servers.py` | Parses, normalizes, deduplicates and validates records |
@@ -27,10 +27,37 @@ server list.
 | `scripts/test_server_list.py` | Standard-library unit tests for the pipeline |
 | `.github/workflows/update-servers.yml` | Scheduled/manual refresh workflow |
 
+## servers.txt format (format version 2)
+
+`servers.txt` is the primary list. It is UTF-8, uses LF line endings, starts
+with comment lines, and then writes one tab-separated record per line. Columns
+are declared by name, so parsers must map them by name rather than position:
+
+```
+# AJX VPN server list
+# format_version=2
+# source=https://www.vpngate.net/api/iphone/
+# last_updated=1794485699687
+# columns=server_id	ip	country_code	country_name	hostname	port	protocol	score	ping	speed	sessions	uptime	total_users	total_traffic	log_type	operator	message	openvpn_config_base64	validation_state	source	last_updated
+4a5e0f2d9c1b7e83	203.0.113.10	JP	Japan	public-vpn-203.0.113.10	443	TCP	2673244	30	273048039	119	1659351416	11368548	658827788456190	2weeks	Example operator		Y2xpZW50CmRldiB0dW4K...	DISCOVERED	vpngate	1794485699687
+```
+
+Format version 1 was a lossy summary with ten columns and no OpenVPN profile. It
+is intentionally rejected as a primary source: without
+`openvpn_config_base64` the Android engine has nothing to connect with.
+
+Required columns are exactly the names shown above. Extra columns may be added
+in a future version and are ignored by a header-driven parser. A row with the
+wrong field count, a duplicate IP, an invalid public IPv4, a missing or invalid
+base64 profile, or a profile whose `remote`/port/protocol does not match the row
+rejects the whole list. An empty list is never published.
+
 ## servers.json format (schema v1)
 
-The Android client already understands this schema; it is the same envelope used
-by the previous VPS API, so no parser rewrite is required.
+This is the compatibility mirror of `servers.txt`. The Android client already
+understands the schema; it is the same envelope used by the previous VPS API, so
+no parser rewrite is required for older builds. New builds prefer
+`servers.txt` and use this file only as a fallback.
 
 ```json
 {
@@ -91,22 +118,6 @@ IP and that the profile port/protocol match the record. This is the same
 strictness the Android client applies, so a malformed row can never make the
 whole downloaded list unusable.
 
-## servers.txt format (format version 1)
-
-The file starts with comment lines and then one tab-separated record per line:
-
-```
-# AJX VPN server list
-# format_version=1
-# source=https://www.vpngate.net/api/iphone/
-# last_updated=1794485699687
-# columns=server_id	ip	country_code	country_name	hostname	port	protocol	validation_state	source	last_updated
-4a5e0f2d9c1b7e83	203.0.113.10	JP	Japan	public-vpn-203.0.113.10	443	TCP	DISCOVERED	vpngate	1794485699687
-```
-
-`servers.txt` deliberately omits the inline profile and full metrics. Use
-`servers.json` when you need the data the engine consumes.
-
 ## Validation states
 
 The list uses the same conservative vocabulary as the Android app:
@@ -130,8 +141,11 @@ valid"; actual connectivity is decided by the Android engine.
 - A blank feed, a feed with no usable records, or fewer than 5 usable records
   aborts the run before any file is replaced.
 - Validation and serialization complete before the first file is written.
-- If the canonical server payload is unchanged, no file is rewritten and the
-  workflow makes no commit. This avoids an empty commit every 30 minutes.
+- The generated `servers.txt` is parsed back and compared field-by-field with
+  `servers.json` before either file is published.
+- If the canonical server payload and the list format version are unchanged, no
+  file is rewritten and the workflow makes no commit. A format upgrade rewrites
+  the files once, even when the server payload is unchanged.
 - If the fetch fails, the workflow fails and the previously published list stays
   in place.
 - Concurrency protection prevents overlapping refreshes.
@@ -142,26 +156,40 @@ valid"; actual connectivity is decided by the Android engine.
 python -m unittest discover -s scripts -p "test_*.py" -v
 python scripts/fetch_servers.py --output /tmp/vpngate.csv
 python scripts/generate_server_list.py --root . --raw /tmp/vpngate.csv
+# Rebuild servers.txt + metadata.json after a format change, without the feed:
+python scripts/generate_server_list.py --root . --from-json
 ```
 
 Python 3.11+ is required. The scripts use only the standard library.
 
 ## Android consumption
 
-After deployment, configure the Android build with the raw URL of
-`servers.json`. The published list for this repository is:
+The Android client uses `servers.txt` as its primary endpoint and keeps
+`servers.json` as a compatibility fallback:
 
 ```
+https://raw.githubusercontent.com/atajanofficial/ajx-vpn-server-list/main/servers.txt
 https://raw.githubusercontent.com/atajanofficial/ajx-vpn-server-list/main/servers.json
 ```
 
+A jsDelivr mirror of the same committed files can be configured as a secondary
+fallback:
+
+```
+https://cdn.jsdelivr.net/gh/atajanofficial/ajx-vpn-server-list@main/servers.txt
+https://cdn.jsdelivr.net/gh/atajanofficial/ajx-vpn-server-list@main/servers.json
+```
+
+The Android build reads `github.servers.txt.url`, `github.servers.json.url` and
+`github.servers.fallbackUrls` from `local.properties`. The client only accepts
+HTTPS URLs on an explicit host allowlist, disables redirects, and keeps its Room
+cache when every endpoint fails.
+
 `raw.githubusercontent.com` caches responses for a few minutes after a refresh,
 so a client may briefly see the previous list; the `ETag` changes when the
-content does.
-
-The exact configuration key (`github.servers.json.url` in `local.properties`)
-and the end-to-end verification steps are documented in the AJX VPN project's
-`GITHUB_SERVER_DEPLOYMENT.md`, not in this repository.
+content does. Each endpoint is tracked with its own `ETag` / `Last-Modified`
+validator, so a fallback success never destroys the primary endpoint's
+conditional-request state.
 
 ## Security
 

@@ -2,9 +2,10 @@
 
 Outputs (all in the repository root):
 
-* ``servers.json`` - authoritative, Android-compatible schema v1 list. It
-  carries the inline OpenVPN profiles the existing engine needs.
-* ``servers.txt`` - human-readable, tab-separated summary of the same records.
+* ``servers.txt`` - authoritative, header-driven format v2 list. It carries the
+  full record set, including the inline OpenVPN profiles the engine needs.
+* ``servers.json`` - the same records in the Android-compatible schema v1
+  envelope, kept as a compatibility mirror.
 * ``metadata.json`` - counts, source provenance, format versions and the
   content hash used for no-change detection.
 
@@ -34,9 +35,13 @@ from validate_servers import (
     SERVER_JSON_SCHEMA_VERSION,
     SOURCE_NAME,
     SOURCE_URL,
+    TXT_COLUMNS,
+    EmptySourceError,
     ServerListError,
     ServerRecord,
     ValidationStats,
+    parse_servers_json,
+    parse_servers_txt,
     parse_source,
     protocol_counts,
     validation_counts,
@@ -47,18 +52,8 @@ SERVERS_TXT = "servers.txt"
 METADATA_JSON = "metadata.json"
 
 VALIDATION_DETAIL = "structurally validated by the refresh workflow; not probed"
-TXT_HEADER_COLUMNS = (
-    "server_id",
-    "ip",
-    "country_code",
-    "country_name",
-    "hostname",
-    "port",
-    "protocol",
-    "validation_state",
-    "source",
-    "last_updated",
-)
+# Kept as an alias for callers that imported the old constant.
+TXT_HEADER_COLUMNS = TXT_COLUMNS
 
 
 @dataclass
@@ -138,7 +133,7 @@ def build_servers_txt(records: List[ServerRecord], refresh_ms: int) -> str:
         f"# format_version={LIST_FORMAT_VERSION}",
         f"# source={SOURCE_URL}",
         f"# last_updated={refresh_ms}",
-        "# columns=" + "\t".join(TXT_HEADER_COLUMNS),
+        "# columns=" + "\t".join(TXT_COLUMNS),
     ]
     for record in records:
         lines.append(
@@ -151,6 +146,17 @@ def build_servers_txt(records: List[ServerRecord], refresh_ms: int) -> str:
                     _txt_field(record.hostname),
                     _txt_field(record.port),
                     _txt_field(record.protocol.upper()),
+                    _txt_field(record.score),
+                    _txt_field(record.ping),
+                    _txt_field(record.speed),
+                    _txt_field(record.sessions),
+                    _txt_field(record.uptime),
+                    _txt_field(record.total_users),
+                    _txt_field(record.total_traffic),
+                    _txt_field(record.log_type),
+                    _txt_field(record.operator),
+                    _txt_field(record.message),
+                    _txt_field(record.openvpn_config_base64),
                     _txt_field(record.validation_state),
                     _txt_field(record.source),
                     _txt_field(refresh_ms),
@@ -182,6 +188,8 @@ def build_metadata(
         "validation_counts": validation_counts(records),
         "content_hash": digest,
         "published_files": [SERVERS_TXT, SERVERS_JSON],
+        "primary_format": SERVERS_TXT,
+        "compatibility_format": SERVERS_JSON,
         "parse_stats": {
             "source_rows": stats.source_rows,
             "accepted": stats.accepted,
@@ -192,7 +200,8 @@ def build_metadata(
         "notes": [
             "DISCOVERED means the record passed structural validation.",
             "No server is probed by this workflow; reachability is not claimed.",
-            "servers.json is the authoritative list consumed by the Android app.",
+            "servers.txt is the primary list consumed by the Android app.",
+            "servers.json carries the same records in the compatible schema v1 envelope.",
         ],
     }
     return json.dumps(document, indent=2, ensure_ascii=False) + "\n"
@@ -271,6 +280,21 @@ def _verify_output(servers_json: str, servers_txt: str, expected_count: int) -> 
     if len(data_lines) != expected_count:
         raise GenerationError("generated servers.txt has the wrong record count")
 
+    # Round-trip the published TXT through the same parser the Android client
+    # uses in spirit: every field must survive, including the OpenVPN profile.
+    try:
+        parsed_txt = parse_servers_txt(servers_txt, min_servers=1)
+    except ServerListError as error:
+        raise GenerationError(f"generated servers.txt failed verification: {error}") from error
+    if len(parsed_txt.records) != expected_count:
+        raise GenerationError("generated servers.txt round-trip has the wrong record count")
+    if parsed_txt.refresh_ms != parsed["last_successful_refresh"]:
+        raise GenerationError("generated servers.txt has the wrong refresh timestamp")
+    if canonical_payload(parsed_txt.records) != servers:
+        raise GenerationError(
+            "generated servers.txt does not round-trip to the servers.json payload"
+        )
+
 
 def generate(
     root: str,
@@ -294,11 +318,19 @@ def generate(
 
     previous_metadata = _read_json(metadata_path)
     previous_hash = previous_metadata.get("content_hash") if previous_metadata else None
+    previous_format = (
+        previous_metadata.get("list_format_version") if previous_metadata else None
+    )
     files_present = all(
         os.path.isfile(path) and os.path.getsize(path) > 0
         for path in (servers_json_path, servers_txt_path, metadata_path)
     )
-    if not force and files_present and previous_hash == digest:
+    if (
+        not force
+        and files_present
+        and previous_hash == digest
+        and previous_format == LIST_FORMAT_VERSION
+    ):
         return GenerationResult(
             changed=False,
             server_count=len(records),
@@ -335,27 +367,115 @@ def generate(
     )
 
 
+def regenerate_from_json(
+    root: str,
+    *,
+    now_ms: Optional[int] = None,
+    min_servers: int = MIN_EXPECTED_SERVERS,
+    force: bool = False,
+) -> GenerationResult:
+    """Rebuilds servers.txt and metadata.json from the committed servers.json.
+
+    The JSON file itself is never rewritten: it stays the authoritative record.
+    This path lets a format upgrade be applied without downloading the upstream
+    feed again, and it is exercised by the unit tests.
+    """
+
+    servers_json_path = os.path.join(root, SERVERS_JSON)
+    servers_txt_path = os.path.join(root, SERVERS_TXT)
+    metadata_path = os.path.join(root, METADATA_JSON)
+
+    try:
+        with open(servers_json_path, "r", encoding="utf-8") as handle:
+            servers_json = handle.read()
+    except OSError as error:
+        raise GenerationError(f"could not read {SERVERS_JSON}: {error}") from error
+
+    parsed = parse_servers_json(servers_json, min_servers=min_servers)
+    records = parsed.records
+    payload = canonical_payload(records)
+    digest = content_hash(payload)
+    refresh_ms = int(now_ms if now_ms is not None else parsed.refresh_ms)
+    if refresh_ms <= 0:
+        raise GenerationError("the refresh timestamp must be positive")
+
+    previous_metadata = _read_json(metadata_path)
+    previous_hash = previous_metadata.get("content_hash") if previous_metadata else None
+    previous_format = (
+        previous_metadata.get("list_format_version") if previous_metadata else None
+    )
+    txt_present = os.path.isfile(servers_txt_path) and os.path.getsize(servers_txt_path) > 0
+    if (
+        not force
+        and txt_present
+        and previous_hash == digest
+        and previous_format == LIST_FORMAT_VERSION
+    ):
+        return GenerationResult(
+            changed=False,
+            server_count=len(records),
+            content_hash=digest,
+            refresh_ms=int(previous_metadata.get("last_changed_at") or refresh_ms),
+            stats=parsed.stats,
+            protocol_counts=protocol_counts(records),
+            validation_counts=validation_counts(records),
+        )
+
+    servers_txt = build_servers_txt(records, refresh_ms)
+    metadata = build_metadata(records, refresh_ms, digest, parsed.stats, SOURCE_URL)
+    _verify_output(servers_json, servers_txt, len(records))
+
+    _write_atomic(servers_txt_path, servers_txt)
+    _write_atomic(metadata_path, metadata)
+
+    return GenerationResult(
+        changed=True,
+        server_count=len(records),
+        content_hash=digest,
+        refresh_ms=refresh_ms,
+        stats=parsed.stats,
+        protocol_counts=protocol_counts(records),
+        validation_counts=validation_counts(records),
+    )
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=".", help="repository root for output files")
-    parser.add_argument("--raw", required=True, help="path to the raw VPN Gate feed")
+    parser.add_argument("--raw", help="path to the raw VPN Gate feed")
+    parser.add_argument(
+        "--from-json",
+        action="store_true",
+        help="rebuild servers.txt and metadata.json from the committed servers.json",
+    )
     parser.add_argument("--source-url", default=SOURCE_URL)
     parser.add_argument("--now", type=int, default=None, help="override refresh time (ms)")
     parser.add_argument("--min-servers", type=int, default=MIN_EXPECTED_SERVERS)
     parser.add_argument("--force", action="store_true", help="rewrite even without changes")
     args = parser.parse_args(argv)
 
+    if not args.from_json and not args.raw:
+        parser.error("either --raw or --from-json is required")
+
     try:
-        with open(args.raw, "r", encoding="utf-8", errors="replace") as handle:
-            raw = handle.read()
-        result = generate(
-            args.root,
-            raw,
-            now_ms=args.now,
-            source_url=args.source_url,
-            min_servers=args.min_servers,
-            force=args.force,
-        )
+        if args.from_json:
+            result = regenerate_from_json(
+                args.root,
+                now_ms=args.now,
+                min_servers=args.min_servers,
+                force=args.force,
+            )
+        else:
+            with open(args.raw, "r", encoding="utf-8", errors="replace") as handle:
+                raw = handle.read()
+            result = generate(
+                args.root,
+                raw,
+                now_ms=args.now,
+                source_url=args.source_url,
+                min_servers=args.min_servers,
+                force=args.force,
+            )
     except (OSError, ServerListError) as error:
         print(f"GENERATION_FAILED: {error}", file=sys.stderr)
         return 1
