@@ -52,15 +52,42 @@ jobs:
       - name: Verify servers.txt round-trips
         run: python scripts/generate_server_list.py --root . --from-json
 
+      # The manifest is always published so clients can verify payload bytes.
+      # The signature is optional: without the secret the manifest is unsigned
+      # and the client reports "hash verified, publisher unverified".
+      - name: Sign the manifest (optional)
+        env:
+          AJX_LIST_SIGNING_KEY: ${{ secrets.AJX_LIST_SIGNING_KEY }}
+          AJX_LIST_SIGNING_KEY_ID: ${{ vars.AJX_LIST_SIGNING_KEY_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${AJX_LIST_SIGNING_KEY:-}" ]; then
+            echo "No AJX_LIST_SIGNING_KEY secret; publishing an unsigned manifest."
+            rm -f manifest.sig
+            exit 0
+          fi
+          python -m pip install --quiet cryptography
+          key_file="$RUNNER_TEMP/ajx-list-signing-key.pem"
+          printf '%s\n' "$AJX_LIST_SIGNING_KEY" > "$key_file"
+          chmod 600 "$key_file"
+          python scripts/sign_manifest.py \
+            --root . \
+            --key-file "$key_file" \
+            --key-id "${AJX_LIST_SIGNING_KEY_ID:-ajx-list}"
+          rm -f "$key_file"
+
       - name: Commit only when the list changed
         run: |
           set -euo pipefail
-          if [ -z "$(git status --porcelain -- servers.txt servers.json metadata.json)" ]; then
+          if [ -z "$(git status --porcelain -- servers.txt servers.json metadata.json manifest.json manifest.sig)" ]; then
             echo "No server-list change; nothing to commit."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add servers.txt servers.json metadata.json
+          git add servers.txt servers.json metadata.json manifest.json
+          if [ -f manifest.sig ]; then
+            git add manifest.sig
+          fi
           git commit -m "chore: refresh VPN Gate server list"
           git push

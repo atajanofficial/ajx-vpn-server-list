@@ -8,6 +8,16 @@ Outputs (all in the repository root):
   envelope, kept as a compatibility mirror.
 * ``metadata.json`` - counts, source provenance, format versions and the
   content hash used for no-change detection.
+* ``manifest.json`` - the exact byte size and SHA-256 of every published list
+  file. The Android client verifies a downloaded payload against this document
+  before parsing it.
+* ``manifest.sig`` - optional detached ECDSA P-256 / SHA-256 signature over the
+  exact bytes of ``manifest.json``. It is produced by ``sign_manifest.py`` from
+  a private key held only in CI, and verified by the client against a public key
+  pinned at build time.
+
+The manifest is the only integrity metadata the client trusts, and it is never
+downloaded from the same HTTP response as the payload it describes.
 
 The generator is fail-safe:
 
@@ -50,6 +60,9 @@ from validate_servers import (
 SERVERS_JSON = "servers.json"
 SERVERS_TXT = "servers.txt"
 METADATA_JSON = "metadata.json"
+MANIFEST_JSON = "manifest.json"
+MANIFEST_SIG = "manifest.sig"
+MANIFEST_VERSION = 1
 
 VALIDATION_DETAIL = "structurally validated by the refresh workflow; not probed"
 # Kept as an alias for callers that imported the old constant.
@@ -65,6 +78,8 @@ class GenerationResult:
     stats: Optional[ValidationStats] = None
     protocol_counts: Optional[Dict[str, int]] = None
     validation_counts: Optional[Dict[str, int]] = None
+    manifest_sha256: str = ""
+    manifest_changed: bool = False
 
 
 class GenerationError(ServerListError):
@@ -109,6 +124,106 @@ def canonical_payload(records: List[ServerRecord]) -> List[Dict[str, object]]:
 def content_hash(payload: List[Dict[str, object]]) -> str:
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _manifest_files(servers_txt: str, servers_json: str) -> List[Dict[str, object]]:
+    """Hashes of the exact UTF-8 bytes that are written to disk."""
+
+    files = []
+    for name, content in ((SERVERS_TXT, servers_txt), (SERVERS_JSON, servers_json)):
+        encoded = content.encode("utf-8")
+        files.append(
+            {
+                "name": name,
+                "size": len(encoded),
+                "sha256": _sha256_hex(encoded),
+            }
+        )
+    return files
+
+
+def build_manifest(
+    servers_txt: str,
+    servers_json: str,
+    refresh_ms: int,
+    server_count: int,
+) -> str:
+    """Deterministic integrity manifest for the two published list files.
+
+    The document deliberately contains no signature field: ``manifest.sig``
+    signs these exact bytes, so adding the signature inside the document would
+    be circular.
+    """
+
+    document = {
+        "manifest_version": MANIFEST_VERSION,
+        "list_format_version": LIST_FORMAT_VERSION,
+        "generated_at": refresh_ms,
+        "server_count": server_count,
+        "primary_format": SERVERS_TXT,
+        "files": _manifest_files(servers_txt, servers_json),
+    }
+    return json.dumps(document, indent=2, ensure_ascii=False) + "\n"
+
+
+def _verify_manifest(
+    manifest: str,
+    servers_txt: str,
+    servers_json: str,
+    expected_count: int,
+) -> None:
+    try:
+        parsed = json.loads(manifest)
+    except ValueError as error:
+        raise GenerationError(f"generated manifest.json is not valid JSON: {error}") from error
+
+    if parsed.get("manifest_version") != MANIFEST_VERSION:
+        raise GenerationError("generated manifest.json has the wrong manifest version")
+    if parsed.get("list_format_version") != LIST_FORMAT_VERSION:
+        raise GenerationError("generated manifest.json has the wrong list format version")
+    if parsed.get("server_count") != expected_count or expected_count <= 0:
+        raise GenerationError("generated manifest.json has the wrong server count")
+    if not isinstance(parsed.get("generated_at"), int) or parsed["generated_at"] <= 0:
+        raise GenerationError("generated manifest.json has an invalid timestamp")
+
+    entries = parsed.get("files")
+    if not isinstance(entries, list) or len(entries) != 2:
+        raise GenerationError("generated manifest.json must describe exactly two files")
+
+    expected = {
+        entry["name"]: (entry["size"], entry["sha256"])
+        for entry in _manifest_files(servers_txt, servers_json)
+    }
+    for entry in entries:
+        name = entry.get("name")
+        if name not in expected:
+            raise GenerationError(f"generated manifest.json lists an unexpected file: {name}")
+        size, digest = expected[name]
+        if entry.get("size") != size or entry.get("sha256") != digest:
+            raise GenerationError(f"generated manifest.json hash mismatch for {name}")
+
+
+def _write_if_changed(path: str, content: str) -> bool:
+    data = content.encode("utf-8")
+    try:
+        with open(path, "rb") as handle:
+            if handle.read() == data:
+                return False
+    except OSError:
+        pass
+    _write_atomic(path, content)
+    return True
+
+
+def _remove_if_exists(path: str) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
 
 
 def build_servers_json(records: List[ServerRecord], refresh_ms: int) -> str:
@@ -171,6 +286,7 @@ def build_metadata(
     refresh_ms: int,
     digest: str,
     stats: ValidationStats,
+    manifest_text: str,
     source_url: str = SOURCE_URL,
 ) -> str:
     document = {
@@ -190,6 +306,21 @@ def build_metadata(
         "published_files": [SERVERS_TXT, SERVERS_JSON],
         "primary_format": SERVERS_TXT,
         "compatibility_format": SERVERS_JSON,
+        "file_hashes": {
+            entry["name"]: {
+                "size": entry["size"],
+                "sha256": entry["sha256"],
+            }
+            for entry in _manifest_files(
+                build_servers_txt(records, refresh_ms),
+                build_servers_json(records, refresh_ms),
+            )
+        },
+        "manifest": {
+            "file": MANIFEST_JSON,
+            "signature_file": MANIFEST_SIG,
+            "sha256": _sha256_hex(manifest_text.encode("utf-8")),
+        },
         "parse_stats": {
             "source_rows": stats.source_rows,
             "accepted": stats.accepted,
@@ -202,6 +333,8 @@ def build_metadata(
             "No server is probed by this workflow; reachability is not claimed.",
             "servers.txt is the primary list consumed by the Android app.",
             "servers.json carries the same records in the compatible schema v1 envelope.",
+            "manifest.json lists the exact byte size and SHA-256 of both files.",
+            "manifest.sig, when present, is a detached ECDSA P-256 signature over manifest.json.",
         ],
     }
     return json.dumps(document, indent=2, ensure_ascii=False) + "\n"
@@ -315,55 +448,64 @@ def generate(
     servers_json_path = os.path.join(root, SERVERS_JSON)
     servers_txt_path = os.path.join(root, SERVERS_TXT)
     metadata_path = os.path.join(root, METADATA_JSON)
+    manifest_path = os.path.join(root, MANIFEST_JSON)
+    signature_path = os.path.join(root, MANIFEST_SIG)
 
     previous_metadata = _read_json(metadata_path)
     previous_hash = previous_metadata.get("content_hash") if previous_metadata else None
     previous_format = (
         previous_metadata.get("list_format_version") if previous_metadata else None
     )
-    files_present = all(
-        os.path.isfile(path) and os.path.getsize(path) > 0
-        for path in (servers_json_path, servers_txt_path, metadata_path)
-    )
-    if (
+    content_unchanged = (
         not force
-        and files_present
         and previous_hash == digest
         and previous_format == LIST_FORMAT_VERSION
-    ):
-        return GenerationResult(
-            changed=False,
-            server_count=len(records),
-            content_hash=digest,
-            refresh_ms=int(previous_metadata.get("last_changed_at") or 0),
-            stats=result.stats,
-            protocol_counts=protocol_counts(records),
-            validation_counts=validation_counts(records),
-        )
+        and os.path.isfile(servers_json_path)
+        and os.path.getsize(servers_json_path) > 0
+        and os.path.isfile(servers_txt_path)
+        and os.path.getsize(servers_txt_path) > 0
+    )
 
-    refresh_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    # Rebuilding an unchanged list is deterministic: the same refresh timestamp
+    # and records produce byte-identical files. That keeps manifest.json stable
+    # (and therefore a detached signature valid) across 30-minute runs.
+    refresh_ms = (
+        int(previous_metadata.get("last_changed_at") or 0)
+        if content_unchanged
+        else int(now_ms if now_ms is not None else time.time() * 1000)
+    )
     if refresh_ms <= 0:
         raise GenerationError("the refresh timestamp must be positive")
 
     servers_json = build_servers_json(records, refresh_ms)
     servers_txt = build_servers_txt(records, refresh_ms)
-    metadata = build_metadata(records, refresh_ms, digest, result.stats, source_url)
+    manifest = build_manifest(servers_txt, servers_json, refresh_ms, len(records))
+    metadata = build_metadata(records, refresh_ms, digest, result.stats, manifest, source_url)
     _verify_output(servers_json, servers_txt, len(records))
+    _verify_manifest(manifest, servers_txt, servers_json, len(records))
 
     # Build every file before replacing any of them. A failure in validation or
     # serialization therefore leaves the previously published list intact.
-    _write_atomic(servers_json_path, servers_json)
-    _write_atomic(servers_txt_path, servers_txt)
-    _write_atomic(metadata_path, metadata)
+    json_changed = _write_if_changed(servers_json_path, servers_json)
+    txt_changed = _write_if_changed(servers_txt_path, servers_txt)
+    _write_if_changed(metadata_path, metadata)
+    manifest_changed = _write_if_changed(manifest_path, manifest)
+    if manifest_changed:
+        # A signature over the previous manifest cannot validate the new bytes.
+        # The CI signing step recreates it; an unsigned run must not leave a
+        # stale signature behind.
+        _remove_if_exists(signature_path)
 
     return GenerationResult(
-        changed=True,
+        changed=json_changed or txt_changed,
         server_count=len(records),
         content_hash=digest,
         refresh_ms=refresh_ms,
         stats=result.stats,
         protocol_counts=protocol_counts(records),
         validation_counts=validation_counts(records),
+        manifest_sha256=_sha256_hex(manifest.encode("utf-8")),
+        manifest_changed=manifest_changed,
     )
 
 
@@ -384,6 +526,8 @@ def regenerate_from_json(
     servers_json_path = os.path.join(root, SERVERS_JSON)
     servers_txt_path = os.path.join(root, SERVERS_TXT)
     metadata_path = os.path.join(root, METADATA_JSON)
+    manifest_path = os.path.join(root, MANIFEST_JSON)
+    signature_path = os.path.join(root, MANIFEST_SIG)
 
     try:
         with open(servers_json_path, "r", encoding="utf-8") as handle:
@@ -395,47 +539,49 @@ def regenerate_from_json(
     records = parsed.records
     payload = canonical_payload(records)
     digest = content_hash(payload)
-    refresh_ms = int(now_ms if now_ms is not None else parsed.refresh_ms)
-    if refresh_ms <= 0:
-        raise GenerationError("the refresh timestamp must be positive")
 
     previous_metadata = _read_json(metadata_path)
     previous_hash = previous_metadata.get("content_hash") if previous_metadata else None
     previous_format = (
         previous_metadata.get("list_format_version") if previous_metadata else None
     )
-    txt_present = os.path.isfile(servers_txt_path) and os.path.getsize(servers_txt_path) > 0
-    if (
+    content_unchanged = (
         not force
-        and txt_present
         and previous_hash == digest
         and previous_format == LIST_FORMAT_VERSION
-    ):
-        return GenerationResult(
-            changed=False,
-            server_count=len(records),
-            content_hash=digest,
-            refresh_ms=int(previous_metadata.get("last_changed_at") or refresh_ms),
-            stats=parsed.stats,
-            protocol_counts=protocol_counts(records),
-            validation_counts=validation_counts(records),
-        )
+        and os.path.isfile(servers_txt_path)
+        and os.path.getsize(servers_txt_path) > 0
+    )
+    refresh_ms = (
+        int(previous_metadata.get("last_changed_at") or 0)
+        if content_unchanged
+        else int(now_ms if now_ms is not None else parsed.refresh_ms)
+    )
+    if refresh_ms <= 0:
+        raise GenerationError("the refresh timestamp must be positive")
 
     servers_txt = build_servers_txt(records, refresh_ms)
-    metadata = build_metadata(records, refresh_ms, digest, parsed.stats, SOURCE_URL)
+    manifest = build_manifest(servers_txt, servers_json, refresh_ms, len(records))
+    metadata = build_metadata(records, refresh_ms, digest, parsed.stats, manifest, SOURCE_URL)
     _verify_output(servers_json, servers_txt, len(records))
+    _verify_manifest(manifest, servers_txt, servers_json, len(records))
 
-    _write_atomic(servers_txt_path, servers_txt)
-    _write_atomic(metadata_path, metadata)
+    txt_changed = _write_if_changed(servers_txt_path, servers_txt)
+    _write_if_changed(metadata_path, metadata)
+    manifest_changed = _write_if_changed(manifest_path, manifest)
+    if manifest_changed:
+        _remove_if_exists(signature_path)
 
     return GenerationResult(
-        changed=True,
+        changed=txt_changed,
         server_count=len(records),
         content_hash=digest,
         refresh_ms=refresh_ms,
         stats=parsed.stats,
         protocol_counts=protocol_counts(records),
         validation_counts=validation_counts(records),
+        manifest_sha256=_sha256_hex(manifest.encode("utf-8")),
+        manifest_changed=manifest_changed,
     )
 
 
@@ -485,6 +631,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         "server_count": result.server_count,
         "content_hash": result.content_hash,
         "refresh_ms": result.refresh_ms,
+        "manifest_sha256": result.manifest_sha256,
+        "manifest_changed": result.manifest_changed,
         "protocol_counts": result.protocol_counts,
         "validation_counts": result.validation_counts,
         "skipped_invalid": result.stats.skipped_invalid if result.stats else 0,

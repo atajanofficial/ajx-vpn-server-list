@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import hashlib
 import io
 import json
 import os
@@ -17,10 +18,13 @@ import unittest
 from typing import List, Optional
 
 from generate_server_list import (
+    MANIFEST_JSON,
+    MANIFEST_SIG,
     METADATA_JSON,
     SERVERS_JSON,
     SERVERS_TXT,
     GenerationError,
+    build_manifest,
     build_servers_txt,
     canonical_payload,
     generate,
@@ -550,6 +554,88 @@ class TxtParsingTest(unittest.TestCase):
 
         self.assertEqual("JP", parsed.records[0].country_code)
         self.assertEqual("Japan", parsed.records[0].country)
+
+
+class ManifestTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = self.temp.name
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def _bytes(self, name: str) -> bytes:
+        with open(os.path.join(self.root, name), "rb") as handle:
+            return handle.read()
+
+    def _text(self, name: str) -> str:
+        return self._bytes(name).decode("utf-8")
+
+    def test_manifest_matches_published_bytes(self) -> None:
+        generate(self.root, make_feed([make_row()]), now_ms=1_700_000_000_000, min_servers=1)
+        manifest = json.loads(self._text(MANIFEST_JSON))
+
+        self.assertEqual(1, manifest["manifest_version"])
+        self.assertEqual(2, manifest["list_format_version"])
+        self.assertEqual(1, manifest["server_count"])
+        self.assertEqual(1_700_000_000_000, manifest["generated_at"])
+        self.assertNotIn("signature", manifest)
+
+        entries = {entry["name"]: entry for entry in manifest["files"]}
+        self.assertEqual({SERVERS_TXT, SERVERS_JSON}, set(entries))
+        for name in (SERVERS_TXT, SERVERS_JSON):
+            payload = self._bytes(name)
+            self.assertEqual(len(payload), entries[name]["size"])
+            self.assertEqual(hashlib.sha256(payload).hexdigest(), entries[name]["sha256"])
+
+    def test_metadata_references_the_manifest(self) -> None:
+        generate(self.root, make_feed([make_row()]), now_ms=1_700_000_000_000, min_servers=1)
+        metadata = json.loads(self._text(METADATA_JSON))
+        manifest = self._bytes(MANIFEST_JSON)
+
+        self.assertEqual(MANIFEST_JSON, metadata["manifest"]["file"])
+        self.assertEqual(
+            hashlib.sha256(manifest).hexdigest(), metadata["manifest"]["sha256"]
+        )
+        self.assertEqual(
+            hashlib.sha256(self._bytes(SERVERS_TXT)).hexdigest(),
+            metadata["file_hashes"][SERVERS_TXT]["sha256"],
+        )
+
+    def test_manifest_is_stable_when_content_is_unchanged(self) -> None:
+        feed = make_feed([make_row()])
+        first = generate(self.root, feed, now_ms=1_700_000_000_000, min_servers=1)
+        first_manifest = self._bytes(MANIFEST_JSON)
+
+        second = generate(self.root, feed, now_ms=1_800_000_000_000, min_servers=1)
+
+        self.assertTrue(first.manifest_changed)
+        self.assertFalse(second.manifest_changed)
+        self.assertEqual(first_manifest, self._bytes(MANIFEST_JSON))
+        self.assertEqual(first.manifest_sha256, second.manifest_sha256)
+
+    def test_manifest_rewrite_removes_a_stale_signature(self) -> None:
+        generate(self.root, make_feed([make_row()]), now_ms=1_700_000_000_000, min_servers=1)
+        with open(os.path.join(self.root, MANIFEST_SIG), "w", encoding="utf-8") as handle:
+            handle.write("{}\n")
+
+        generate(
+            self.root,
+            make_feed([make_row(ip="9.9.9.9", score=2000)]),
+            now_ms=1_800_000_000_000,
+            min_servers=1,
+        )
+
+        self.assertFalse(os.path.exists(os.path.join(self.root, MANIFEST_SIG)))
+
+    def test_build_manifest_rejects_a_mismatched_size(self) -> None:
+        manifest = build_manifest("a\n", "b\n", 1_700_000_000_000, 1)
+        parsed = json.loads(manifest)
+        parsed["files"][0]["size"] = 999
+        from generate_server_list import _verify_manifest
+
+        with self.assertRaises(GenerationError):
+            _verify_manifest(json.dumps(parsed), "a\n", "b\n", 1)
 
 
 if __name__ == "__main__":
