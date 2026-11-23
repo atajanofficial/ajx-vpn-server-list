@@ -23,17 +23,34 @@
   ],
   "primary_format": "servers.txt",
   "compatibility_format": "servers.json",
+  "file_hashes": {
+    "servers.txt": {
+      "size": 1285736,
+      "sha256": "0ace23fd254f0c9f051a453672e82cb2ef171c4992a3b2f632ebd3111e34d8a6"
+    },
+    "servers.json": {
+      "size": 1336937,
+      "sha256": "407ef8b6e65a5bcd757e334e7a042d3693d905581c6b88e4abd901fad79e1939"
+    }
+  },
+  "manifest": {
+    "file": "manifest.json",
+    "signature_file": "manifest.sig",
+    "sha256": "e34bdba0492e8d2ffd3302f323f9ca61c8af1a3b83675c62ad8f2b1c6c02638a"
+  },
   "parse_stats": {
-    "source_rows": 99,
+    "source_rows": 95,
     "accepted": 95,
     "skipped_invalid": 0,
-    "skipped_duplicate": 4,
+    "skipped_duplicate": 0,
     "rejection_reasons": {}
   },
   "notes": [
     "DISCOVERED means the record passed structural validation.",
     "No server is probed by this workflow; reachability is not claimed.",
     "servers.txt is the primary list consumed by the Android app.",
-    "servers.json carries the same records in the compatible schema v1 envelope."
+    "servers.json carries the same records in the compatible schema v1 envelope.",
+    "manifest.json lists the exact byte size and SHA-256 of both files.",
+    "manifest.sig, when present, is a detached ECDSA P-256 signature over manifest.json."
   ]
 }
