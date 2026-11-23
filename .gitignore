@@ -7,6 +7,9 @@ __pycache__/
 raw.csv
 vpngate.csv
 
+# Generated Cloudflare Pages deployment directory
+cloudflare-pages/
+
 # OS noise
 .DS_Store
 Thumbs.db

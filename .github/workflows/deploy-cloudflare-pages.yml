@@ -1,0 +1,122 @@
+name: Deploy server list to Cloudflare Pages
+
+# Manual only: the existing "Update server list" workflow remains the publisher
+# of record. This workflow deploys the exact files already committed on main.
+# The repository owner must add CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID
+# in Settings -> Secrets and variables -> Actions before running it.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  deployments: write
+
+concurrency:
+  group: ajx-vpn-cloudflare-pages
+  cancel-in-progress: false
+
+env:
+  PAGES_PROJECT: ajx-vpn-servers
+  PAGES_HOST: ajx-vpn-servers.pages.dev
+
+jobs:
+  deploy:
+    name: Validate and deploy static list
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.ref_name == github.event.repository.default_branch
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run all publisher tests
+        run: python -m unittest discover -s scripts -p "test_*.py" -v
+
+      - name: Build the deployment directory from committed files
+        run: python scripts/build_cloudflare_pages.py --root . --output cloudflare-pages
+
+      - name: Deploy with the official Wrangler GitHub Action
+        id: deploy
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy cloudflare-pages --project-name=${{ env.PAGES_PROJECT }} --branch=main
+
+      - name: Verify DNS, HTTPS bytes and conditional requests
+        run: |
+          set -euo pipefail
+
+          echo "Resolving ${PAGES_HOST}"
+          getent ahostsv4 "${PAGES_HOST}" | awk '{print $1}' | sort -u | tee /tmp/pages-ips.txt || true
+          if [ ! -s /tmp/pages-ips.txt ]; then
+            echo "Host did not resolve; deployment is not usable." >&2
+            exit 1
+          fi
+          if grep -Eq '^127\.' /tmp/pages-ips.txt; then
+            echo "Host still resolves to loopback; deployment is not usable." >&2
+            exit 1
+          fi
+
+          for path in servers.txt servers.json manifest.json index.html; do
+            code=""
+            for attempt in $(seq 1 12); do
+              code="$(curl -sS -o "/tmp/${path}" -w '%{http_code}' \
+                "https://${PAGES_HOST}/${path}" || true)"
+              if [ "${code}" = "200" ]; then
+                break
+              fi
+              echo "${path}: HTTP ${code}, retrying (${attempt}/12)"
+              sleep 10
+            done
+            if [ "${code}" != "200" ]; then
+              echo "${path} did not return HTTP 200" >&2
+              exit 1
+            fi
+          done
+
+          echo "Comparing downloaded bytes with the committed dataset"
+          cmp cloudflare-pages/servers.txt /tmp/servers.txt
+          cmp cloudflare-pages/servers.json /tmp/servers.json
+          cmp cloudflare-pages/manifest.json /tmp/manifest.json
+
+          python - <<'PY'
+          import hashlib
+          import json
+          import pathlib
+
+          root = pathlib.Path("cloudflare-pages")
+          downloaded = pathlib.Path("/tmp")
+          manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+          assert manifest["manifest_version"] == 1
+          assert manifest["list_format_version"] == 2
+          assert manifest["server_count"] > 0
+          for entry in manifest["files"]:
+              published = (root / entry["name"]).read_bytes()
+              remote = (downloaded / entry["name"]).read_bytes()
+              assert len(published) == entry["size"]
+              assert hashlib.sha256(remote).hexdigest() == entry["sha256"]
+          txt = (downloaded / "servers.txt").read_text(encoding="utf-8")
+          assert txt.startswith("# AJX VPN server list\n")
+          assert "# format_version=2\n" in txt
+          print("Live bytes match the validated manifest.")
+          PY
+
+          etag="$(curl -sSI "https://${PAGES_HOST}/servers.txt" \
+            | tr -d '\r' | awk 'tolower($1)=="etag:" {print $2; exit}')"
+          if [ -z "${etag}" ]; then
+            echo "No ETag returned for servers.txt" >&2
+            exit 1
+          fi
+          conditional="$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "If-None-Match: ${etag}" "https://${PAGES_HOST}/servers.txt")"
+          if [ "${conditional}" != "304" ]; then
+            echo "Conditional request returned HTTP ${conditional}, expected 304" >&2
+            exit 1
+          fi
+          echo "ETag/304 conditional request verified."
