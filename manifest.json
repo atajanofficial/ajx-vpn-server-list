@@ -1,19 +1,19 @@
 {
   "manifest_version": 1,
   "list_format_version": 2,
-  "generated_at": 1795466697053,
-  "server_count": 96,
+  "generated_at": 1795496689972,
+  "server_count": 92,
   "primary_format": "servers.txt",
   "files": [
     {
       "name": "servers.txt",
-      "size": 1299028,
-      "sha256": "24ebc18524e4a44de42d3ef6dbe1f191f56c6fb0519a198f2d989879af495273"
+      "size": 1245309,
+      "sha256": "dd0167b605d0d737c14f10b69adc4b7cd276ca7c7ef1a5f8a6a6cbb6585e9b64"
     },
     {
       "name": "servers.json",
-      "size": 1350770,
-      "sha256": "ab41978a832d6ea4ed6ed0bb4d2dcb23bac22f15b4f40aebc153228366a313a7"
+      "size": 1294887,
+      "sha256": "049356401013b7fab5c9b44376fd7b95e5d3d43f8fdd931affe7676dd9eda7dd"
     }
   ]
 }
