@@ -1,0 +1,268 @@
+name: Deploy server list to Firebase Hosting
+
+# Manual only: the existing "Update server list" workflow remains the publisher
+# of record. This workflow deploys the exact files already committed on main to
+# an additional, independent static host.
+#
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#   FIREBASE_SERVICE_ACCOUNT  service-account JSON with Hosting deploy rights
+#   FIREBASE_PROJECT_ID       the verified Firebase project id
+#
+# The project id must be checked in the Firebase Console before the first run.
+# Never commit either secret.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ajx-vpn-firebase-hosting
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Validate and deploy static list
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    if: github.ref_name == github.event.repository.default_branch
+    env:
+      FIREBASE_PROJECT: ${{ secrets.FIREBASE_PROJECT_ID }}
+      FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Require deployment credentials
+        run: |
+          set -euo pipefail
+          if [ -z "${FIREBASE_PROJECT}" ]; then
+            echo "FIREBASE_PROJECT_ID is not configured." >&2
+            exit 1
+          fi
+          if [ -z "${FIREBASE_SERVICE_ACCOUNT}" ]; then
+            echo "FIREBASE_SERVICE_ACCOUNT is not configured." >&2
+            exit 1
+          fi
+
+      - name: Run all publisher tests
+        run: python -m unittest discover -s scripts -p "test_*.py" -v
+
+      - name: Build the deployment directory from committed files
+        run: python scripts/build_firebase_hosting.py --root . --output firebase-hosting
+
+      - name: Verify deployment contents before upload
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import sys
+
+          sys.path.insert(0, "scripts")
+          from generate_server_list import canonical_payload
+          from validate_servers import TXT_COLUMNS, parse_servers_json, parse_servers_txt
+
+          root = pathlib.Path("firebase-hosting")
+          expected = {
+              "servers.txt", "servers.json", "manifest.json",
+              "index.html", "firebase.json", ".firebaserc",
+          }
+          actual = {entry.name for entry in root.iterdir()}
+          assert actual == expected, f"unexpected deployment files: {sorted(actual)}"
+
+          project = json.loads((root / ".firebaserc").read_text(encoding="utf-8"))
+          assert project["projects"]["default"] == os.environ["FIREBASE_PROJECT"], (
+              "FIREBASE_PROJECT_ID does not match the generated .firebaserc"
+          )
+
+          config = json.loads((root / "firebase.json").read_text(encoding="utf-8"))
+          hosting = config["hosting"]
+          assert hosting["public"] == "."
+          assert "firebase.json" in hosting["ignore"]
+          assert ".firebaserc" in hosting["ignore"]
+          assert "rewrites" not in hosting and "redirects" not in hosting
+
+          manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+          assert manifest["manifest_version"] == 1
+          assert manifest["list_format_version"] == 2
+          count = manifest["server_count"]
+          assert count > 0
+
+          for entry in manifest["files"]:
+              payload = (root / entry["name"]).read_bytes()
+              assert len(payload) == entry["size"]
+              assert hashlib.sha256(payload).hexdigest() == entry["sha256"]
+
+          txt = parse_servers_txt(
+              (root / "servers.txt").read_text(encoding="utf-8"), min_servers=5
+          )
+          parsed_json = parse_servers_json(
+              (root / "servers.json").read_text(encoding="utf-8"), min_servers=5
+          )
+          assert len(TXT_COLUMNS) == 21
+          assert len(txt.records) == count == len(parsed_json.records)
+          assert canonical_payload(txt.records) == canonical_payload(parsed_json.records)
+          print(f"Validated {count} records with {len(TXT_COLUMNS)} TXT columns.")
+          PY
+
+      - name: Deploy the live channel with the official Firebase action
+        uses: FirebaseExtended/action-hosting-deploy@v0
+        with:
+          firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          projectId: ${{ env.FIREBASE_PROJECT }}
+          channelId: live
+          entryPoint: firebase-hosting
+          disableComment: true
+
+      - name: Verify DNS, HTTPS bytes, headers and conditional requests
+        run: |
+          set -euo pipefail
+
+          HOST="${FIREBASE_PROJECT}.web.app"
+          echo "Resolving ${HOST}"
+          getent ahostsv4 "${HOST}" | awk '{print $1}' | sort -u | tee /tmp/firebase-ips.txt || true
+          if [ ! -s /tmp/firebase-ips.txt ]; then
+            echo "Host did not resolve; deployment is not usable." >&2
+            exit 1
+          fi
+          if grep -Eq '^127\.' /tmp/firebase-ips.txt; then
+            echo "Host resolves to loopback; deployment is not usable." >&2
+            exit 1
+          fi
+
+          mkdir -p /tmp/firebase-live
+          for path in servers.txt servers.json manifest.json index.html; do
+            code=""
+            for attempt in $(seq 1 12); do
+              code="$(curl -sS -o "/tmp/firebase-live/${path}" -w '%{http_code}' \
+                "https://${HOST}/${path}" || true)"
+              if [ "${code}" = "200" ]; then
+                break
+              fi
+              echo "${path}: HTTP ${code}, retrying (${attempt}/12)"
+              sleep 10
+            done
+            if [ "${code}" != "200" ]; then
+              echo "${path} did not return HTTP 200" >&2
+              exit 1
+            fi
+            cmp "firebase-hosting/${path}" "/tmp/firebase-live/${path}"
+          done
+
+          root_code=""
+          for attempt in $(seq 1 12); do
+            root_code="$(curl -sS -o /tmp/firebase-live/root.html -w '%{http_code}' \
+              "https://${HOST}/" || true)"
+            if [ "${root_code}" = "200" ]; then
+              break
+            fi
+            echo "/: HTTP ${root_code}, retrying (${attempt}/12)"
+            sleep 10
+          done
+          if [ "${root_code}" != "200" ]; then
+            echo "/ did not return HTTP 200" >&2
+            exit 1
+          fi
+          cmp firebase-hosting/index.html /tmp/firebase-live/root.html
+
+          echo "Comparing downloaded bytes with the validated dataset"
+          python - <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          sys.path.insert(0, "scripts")
+          from generate_server_list import canonical_payload
+          from validate_servers import TXT_COLUMNS, parse_servers_json, parse_servers_txt
+
+          root = pathlib.Path("firebase-hosting")
+          live = pathlib.Path("/tmp/firebase-live")
+          manifest = json.loads(live.joinpath("manifest.json").read_text(encoding="utf-8"))
+          assert manifest["manifest_version"] == 1
+          assert manifest["list_format_version"] == 2
+          count = manifest["server_count"]
+          for entry in manifest["files"]:
+              payload = live.joinpath(entry["name"]).read_bytes()
+              assert len(payload) == entry["size"]
+              assert hashlib.sha256(payload).hexdigest() == entry["sha256"]
+              assert payload == root.joinpath(entry["name"]).read_bytes()
+
+          txt = parse_servers_txt(
+              live.joinpath("servers.txt").read_text(encoding="utf-8"), min_servers=5
+          )
+          parsed_json = parse_servers_json(
+              live.joinpath("servers.json").read_text(encoding="utf-8"), min_servers=5
+          )
+          assert len(TXT_COLUMNS) == 21
+          assert len(txt.records) == count == len(parsed_json.records)
+          assert canonical_payload(txt.records) == canonical_payload(parsed_json.records)
+          print(f"Live list matches the manifest: {count} records, {len(TXT_COLUMNS)} columns.")
+          PY
+
+          header_value() {
+            printf '%s\n' "$1" | tr -d '\r' | grep -i "^$2:" | head -n1 \
+              | sed -E 's/^[^:]+:[[:space:]]*//' || true
+          }
+
+          check_headers() {
+            path="$1"
+            expected_type="$2"
+            headers="$(curl -sS -D - -o /dev/null "https://${HOST}/${path}")"
+            content_type="$(header_value "${headers}" Content-Type)"
+            cache_control="$(header_value "${headers}" Cache-Control)"
+            nosniff="$(header_value "${headers}" X-Content-Type-Options)"
+            cors="$(header_value "${headers}" Access-Control-Allow-Origin)"
+            case "${content_type}" in
+              "${expected_type}"*) ;;
+              *) echo "${path}: unexpected Content-Type ${content_type}" >&2; exit 1 ;;
+            esac
+            case "${cache_control}" in
+              *max-age=0*must-revalidate*) ;;
+              *) echo "${path}: unexpected Cache-Control ${cache_control}" >&2; exit 1 ;;
+            esac
+            [ "${nosniff}" = "nosniff" ] || { echo "${path}: missing nosniff" >&2; exit 1; }
+            [ "${cors}" = "*" ] || { echo "${path}: missing CORS header" >&2; exit 1; }
+          }
+
+          check_headers servers.txt text/plain
+          check_headers servers.json application/json
+          check_headers manifest.json application/json
+
+          for private_path in firebase.json .firebaserc; do
+            code="$(curl -sS -o /dev/null -w '%{http_code}' "https://${HOST}/${private_path}")"
+            if [ "${code}" != "404" ]; then
+              echo "${private_path} is publicly reachable (HTTP ${code})" >&2
+              exit 1
+            fi
+          done
+
+          headers="$(curl -sS -D - -o /dev/null "https://${HOST}/servers.txt")"
+          etag="$(header_value "${headers}" ETag)"
+          last_modified="$(header_value "${headers}" Last-Modified)"
+          if [ -z "${etag}" ] && [ -z "${last_modified}" ]; then
+            echo "servers.txt returned no ETag or Last-Modified validator" >&2
+            exit 1
+          fi
+          if [ -n "${etag}" ]; then
+            conditional="$(curl -sS -o /dev/null -w '%{http_code}' \
+              -H "If-None-Match: ${etag}" "https://${HOST}/servers.txt")"
+            validator="ETag"
+          else
+            conditional="$(curl -sS -o /dev/null -w '%{http_code}' \
+              -H "If-Modified-Since: ${last_modified}" "https://${HOST}/servers.txt")"
+            validator="Last-Modified"
+          fi
+          if [ "${conditional}" != "304" ]; then
+            echo "${validator} conditional request returned HTTP ${conditional}, expected 304" >&2
+            exit 1
+          fi
+          echo "Live bytes, headers and ${validator}/304 revalidation verified."

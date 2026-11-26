@@ -10,6 +10,9 @@ vpngate.csv
 # Generated Cloudflare Pages deployment directory
 cloudflare-pages/
 
+# Generated Firebase Hosting deployment directory (rebuilt by the workflow)
+firebase-hosting/
+
 # OS noise
 .DS_Store
 Thumbs.db

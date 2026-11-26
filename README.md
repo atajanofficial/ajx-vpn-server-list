@@ -26,6 +26,7 @@ server list.
 | `scripts/generate_server_list.py` | Writes the three published files, only when content changed |
 | `scripts/test_server_list.py` | Standard-library unit tests for the pipeline |
 | `.github/workflows/update-servers.yml` | Scheduled/manual refresh workflow |
+| `FIREBASE_HOSTING.md` | Account setup, deployment gate and live checks for the Firebase mirror |
 
 ## servers.txt format (format version 2)
 
