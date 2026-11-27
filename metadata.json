@@ -4,19 +4,19 @@
   "source": {
     "name": "VPN Gate",
     "url": "https://www.vpngate.net/api/iphone/",
-    "retrieved_at": 1795784011846
+    "retrieved_at": 1795815897637
   },
-  "generated_at": 1795784011846,
-  "last_changed_at": 1795784011846,
-  "server_count": 100,
+  "generated_at": 1795815897637,
+  "last_changed_at": 1795815897637,
+  "server_count": 97,
   "protocol_counts": {
-    "tcp": 88,
-    "udp": 12
+    "tcp": 83,
+    "udp": 14
   },
   "validation_counts": {
-    "DISCOVERED": 100
+    "DISCOVERED": 97
   },
-  "content_hash": "c24413dbf371e50330c608e30b1b851022e8d7c2f92db22b22d2812685d75a87",
+  "content_hash": "385c97100f6909db8fd07408aefb0cdf011c9ba47087dd891aee2220c7faefdf",
   "published_files": [
     "servers.txt",
     "servers.json"
@@ -25,22 +25,22 @@
   "compatibility_format": "servers.json",
   "file_hashes": {
     "servers.txt": {
-      "size": 1353098,
-      "sha256": "5a13621a231619fb11fe5376e0d6174641efa83127d8908c32469f0cc7197b56"
+      "size": 1312653,
+      "sha256": "2e47936b738426f4cf344dd14c88da2140aa5d29162075dec7896a52f4e3ce8c"
     },
     "servers.json": {
-      "size": 1407004,
-      "sha256": "a35d6882b3b6cacb8166e59c522379161912d954a73fa634cd51770039e474f7"
+      "size": 1364936,
+      "sha256": "7aedce4649d7a5f520e2bc5cf6aecbfd31a1d2e8d94ef2a33e25aa86020c188b"
     }
   },
   "manifest": {
     "file": "manifest.json",
     "signature_file": "manifest.sig",
-    "sha256": "ce63e2ef20acb0928c72929f003a8ffa65e102fae6b4f7d58e4da7cb2258d909"
+    "sha256": "e0c6e6a847d21a8f949b5587859f73e436c4af1b1b2edc10167d064b078e5905"
   },
   "parse_stats": {
-    "source_rows": 100,
-    "accepted": 100,
+    "source_rows": 97,
+    "accepted": 97,
     "skipped_invalid": 0,
     "skipped_duplicate": 0,
     "rejection_reasons": {}
